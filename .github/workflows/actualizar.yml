@@ -1,4 +1,4 @@
-name: Organizar catálogo de películas
+name: Actualizar y validar catálogo
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
       - main
     paths:
       - 'urls.txt'
-      - 'organizar_catalogo_sin_extractor.py'
+      - '.github/workflows/actualizar.yml'
   schedule:
     - cron: '0 */6 * * *'
   workflow_dispatch:
@@ -21,85 +21,242 @@ jobs:
     steps:
       - name: Descargar repositorio
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Verificar archivos necesarios
+      - name: Validar urls.txt y organizar categorías
+        shell: bash
         run: |
-          if [ ! -f "urls.txt" ]; then
-            echo "❌ urls.txt no encontrado"
+          set -euo pipefail
+
+          if [ ! -f urls.txt ]; then
+            echo "::error::No existe urls.txt en la raíz del repositorio."
             exit 1
           fi
 
-          if [ ! -f "organizar_catalogo_sin_extractor.py" ]; then
-            echo "❌ organizar_catalogo_sin_extractor.py no encontrado"
-            exit 1
-          fi
+          cp urls.txt /tmp/urls.txt.original
 
-          echo "✅ Archivos necesarios encontrados"
+          python - <<'PY'
+          import json
+          import re
+          import sys
+          import unicodedata
+          from pathlib import Path
+          from urllib.parse import urlparse
 
-      - name: Guardar copia de seguridad de urls.txt
+          root = Path(".")
+          source = root / "urls.txt"
+          movies_dir = root / "peliculas"
+          category_file = root / "category_list.json"
+
+          raw = source.read_text(encoding="utf-8-sig").strip()
+          if not raw:
+              raise SystemExit("::error::urls.txt existe, pero está vacío.")
+
+          try:
+              records = json.loads(raw)
+          except json.JSONDecodeError as exc:
+              raise SystemExit(
+                  f"::error::urls.txt no contiene JSON válido (línea {exc.lineno}, "
+                  f"columna {exc.colno}): {exc.msg}"
+              )
+
+          # Aceptar tanto una lista de películas como un objeto con una lista dentro.
+          if isinstance(records, dict):
+              for key in ("peliculas", "movies", "results", "data"):
+                  if isinstance(records.get(key), list):
+                      records = records[key]
+                      break
+
+          if not isinstance(records, list):
+              raise SystemExit(
+                  "::error::El JSON de urls.txt debe ser una lista de películas "
+                  "o un objeto que contenga peliculas/movies/results/data."
+              )
+          if not records:
+              raise SystemExit("::error::urls.txt no contiene películas.")
+
+          def category_filename(value):
+              value = str(value or "GENERAL").strip().upper()
+              value = unicodedata.normalize("NFKD", value)
+              value = "".join(ch for ch in value if not unicodedata.combining(ch))
+              value = re.sub(r"[^A-Z0-9 _-]", "", value)
+              value = re.sub(r"[\s-]+", "_", value).strip("_")
+              return value or "GENERAL"
+
+          def get_id(item):
+              for key in ("ID_VIDEO", "ID_OKRU", "TMDB_ID", "ID"):
+                  value = item.get(key)
+                  if value not in (None, ""):
+                      return str(value)
+              return None
+
+          def get_urls(item):
+              # Validar las URL originales; nunca resolver enlaces directos aquí.
+              value = item.get("URLS")
+              if value is None:
+                  value = item.get("URLS_OKRU")
+              if value is None:
+                  value = item.get("URL")
+              if isinstance(value, str):
+                  return [value] if value.strip() else []
+              if isinstance(value, list):
+                  return [u for u in value if isinstance(u, str) and u.strip()]
+              return []
+
+          valid_records = []
+          invalid_records = []
+          no_url_records = []
+          grouped = {}
+
+          for index, item in enumerate(records, start=1):
+              if not isinstance(item, dict):
+                  invalid_records.append(f"Registro #{index}: no es un objeto JSON.")
+                  continue
+
+              title = str(item.get("TITULO") or item.get("titulo") or f"Registro #{index}")
+              urls = get_urls(item)
+              if not urls:
+                  no_url_records.append(title)
+                  continue
+
+              valid_urls = []
+              invalid_urls = []
+              for candidate in urls:
+                  candidate = candidate.strip()
+                  normalized = candidate if candidate.startswith(("http://", "https://")) else "https://" + candidate
+                  parsed = urlparse(normalized)
+                  if parsed.scheme in ("http", "https") and parsed.netloc and "." in parsed.netloc:
+                      valid_urls.append(candidate)
+                  else:
+                      invalid_urls.append(candidate)
+
+              if invalid_urls:
+                  invalid_records.append(
+                      f"{title}: URL(s) con formato inválido: {', '.join(invalid_urls)}"
+                  )
+              if not valid_urls:
+                  no_url_records.append(title)
+                  continue
+
+              # Preservar las URL originales tal como venían en urls.txt.
+              item = dict(item)
+              item.pop("URLS_DIRECTAS", None)
+              item.pop("URL_DIRECTA", None)
+              category = category_filename(item.get("CATEGORIA", "GENERAL"))
+              item["CATEGORIA"] = category
+              grouped.setdefault(category, []).append(item)
+              valid_records.append(title)
+
+          if invalid_records:
+              print("⚠️ Se encontraron entradas con URL/formato inválido:")
+              for message in invalid_records:
+                  print(f"  - {message}")
+
+          if no_url_records:
+              print("⚠️ Registros sin ninguna URL válida:")
+              for title in no_url_records:
+                  print(f"  - {title}")
+
+          if not grouped:
+              raise SystemExit(
+                  "::error::No hay películas con al menos una URL válida. "
+                  "No se actualizará el catálogo."
+              )
+
+          movies_dir.mkdir(parents=True, exist_ok=True)
+
+          # Actualizar por categoría; conservar registros anteriores no repetidos.
+          for category, incoming in grouped.items():
+              path = movies_dir / f"{category}.json"
+              try:
+                  existing = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+                  if not isinstance(existing, list):
+                      existing = []
+              except (OSError, json.JSONDecodeError):
+                  existing = []
+
+              positions = {}
+              for i, old in enumerate(existing):
+                  if isinstance(old, dict):
+                      old_id = get_id(old)
+                      if old_id is not None:
+                          positions[old_id] = i
+
+              for item in incoming:
+                  item_id = get_id(item)
+                  if item_id is not None and item_id in positions:
+                      existing[positions[item_id]] = item
+                  else:
+                      if item_id is not None:
+                          positions[item_id] = len(existing)
+                      existing.append(item)
+
+              path.write_text(
+                  json.dumps(existing, ensure_ascii=False, indent=2) + "\n",
+                  encoding="utf-8"
+              )
+              print(f"✅ {path}: {len(incoming)} entradas recibidas; {len(existing)} en total")
+
+          # No borrar categorías previas: incluir archivos de categorías existentes.
+          categories = sorted(
+              path.stem for path in movies_dir.glob("*.json")
+              if path.is_file() and path.name.lower() != "category_list.json"
+          )
+          category_file.write_text(
+              json.dumps(categories, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8"
+          )
+
+          print("---- Resumen de validación ----")
+          print(f"Registros leídos: {len(records)}")
+          print(f"Registros con URL válida organizados: {len(valid_records)}")
+          print(f"Categorías en catálogo: {len(categories)}")
+          print(f"Registros con errores de URL: {len(invalid_records)}")
+          print(f"Registros sin URL válida: {len(no_url_records)}")
+
+          # URLs inválidas se reportan, pero no bloquean todo el catálogo
+          # si existen otras películas válidas.
+          PY
+
+      - name: Verificar que urls.txt no fue modificado
         run: |
-          cp urls.txt /tmp/urls.txt.backup
-          sha256sum urls.txt > /tmp/urls.txt.sha256
-
-      - name: Organizar películas y categorías
-        run: python organizar_catalogo_sin_extractor.py
-        env:
-          PYTHONUNBUFFERED: 1
-
-      - name: Verificar que urls.txt no fue borrado ni modificado
-        run: |
-          if [ ! -f "urls.txt" ]; then
-            echo "❌ urls.txt fue borrado. Se cancela la publicación."
+          if [ ! -f urls.txt ]; then
+            echo "::error::urls.txt fue borrado."
             exit 1
           fi
-
-          if ! cmp -s urls.txt /tmp/urls.txt.backup; then
-            echo "❌ urls.txt fue modificado. Se cancela la publicación."
+          if ! cmp -s urls.txt /tmp/urls.txt.original; then
+            echo "::error::urls.txt fue modificado durante el workflow."
             exit 1
           fi
+          echo "✅ urls.txt existe y permanece intacto."
 
-          echo "✅ urls.txt permanece intacto"
-
-      - name: Validar archivos de categorías
+      - name: Validar JSON generados
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
 
-          category_file = Path("category_list.json")
-          movies_dir = Path("peliculas")
-
-          if not category_file.is_file():
-              raise SystemExit("❌ category_list.json no fue generado")
-
-          categories = json.loads(category_file.read_text(encoding="utf-8"))
+          categories = json.loads(Path("category_list.json").read_text(encoding="utf-8"))
           if not isinstance(categories, list):
-              raise SystemExit("❌ category_list.json debe contener una lista")
-
-          if not movies_dir.is_dir():
-              raise SystemExit("❌ No existe la carpeta peliculas/")
+              raise SystemExit("category_list.json no es una lista.")
 
           for category in categories:
-              path = movies_dir / f"{category}.json"
+              path = Path("peliculas") / f"{category}.json"
               if not path.is_file():
-                  raise SystemExit(f"❌ Falta el archivo de categoría: {path}")
+                  raise SystemExit(f"Falta el archivo {path}")
               data = json.loads(path.read_text(encoding="utf-8"))
               if not isinstance(data, list):
-                  raise SystemExit(f"❌ {path} debe contener una lista JSON")
-
-          print(f"✅ Catálogo validado: {len(categories)} categorías")
+                  raise SystemExit(f"{path} no contiene una lista JSON.")
+          print(f"✅ JSON validados: {len(categories)} categorías.")
           PY
 
-      - name: Guardar cambios del catálogo
+      - name: Commit y push del catálogo
         run: |
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
           git add peliculas/ category_list.json
           if git diff --cached --quiet; then
-            echo "ℹ️ El catálogo no tuvo cambios; no se crea commit."
+            echo "ℹ️ No hay cambios en el catálogo."
             exit 0
           fi
-          git commit -m "🔄 Catálogo organizado - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          git commit -m "🔄 Catálogo validado y organizado - $(date -u +'%Y-%m-%d %H:%M UTC')"
           git push
