@@ -1,0 +1,105 @@
+name: Organizar catálogo de películas
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'urls.txt'
+      - 'organizar_catalogo_sin_extractor.py'
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  organizar-catalogo:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verificar archivos necesarios
+        run: |
+          if [ ! -f "urls.txt" ]; then
+            echo "❌ urls.txt no encontrado"
+            exit 1
+          fi
+
+          if [ ! -f "organizar_catalogo_sin_extractor.py" ]; then
+            echo "❌ organizar_catalogo_sin_extractor.py no encontrado"
+            exit 1
+          fi
+
+          echo "✅ Archivos necesarios encontrados"
+
+      - name: Guardar copia de seguridad de urls.txt
+        run: |
+          cp urls.txt /tmp/urls.txt.backup
+          sha256sum urls.txt > /tmp/urls.txt.sha256
+
+      - name: Organizar películas y categorías
+        run: python organizar_catalogo_sin_extractor.py
+        env:
+          PYTHONUNBUFFERED: 1
+
+      - name: Verificar que urls.txt no fue borrado ni modificado
+        run: |
+          if [ ! -f "urls.txt" ]; then
+            echo "❌ urls.txt fue borrado. Se cancela la publicación."
+            exit 1
+          fi
+
+          if ! cmp -s urls.txt /tmp/urls.txt.backup; then
+            echo "❌ urls.txt fue modificado. Se cancela la publicación."
+            exit 1
+          fi
+
+          echo "✅ urls.txt permanece intacto"
+
+      - name: Validar archivos de categorías
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          category_file = Path("category_list.json")
+          movies_dir = Path("peliculas")
+
+          if not category_file.is_file():
+              raise SystemExit("❌ category_list.json no fue generado")
+
+          categories = json.loads(category_file.read_text(encoding="utf-8"))
+          if not isinstance(categories, list):
+              raise SystemExit("❌ category_list.json debe contener una lista")
+
+          if not movies_dir.is_dir():
+              raise SystemExit("❌ No existe la carpeta peliculas/")
+
+          for category in categories:
+              path = movies_dir / f"{category}.json"
+              if not path.is_file():
+                  raise SystemExit(f"❌ Falta el archivo de categoría: {path}")
+              data = json.loads(path.read_text(encoding="utf-8"))
+              if not isinstance(data, list):
+                  raise SystemExit(f"❌ {path} debe contener una lista JSON")
+
+          print(f"✅ Catálogo validado: {len(categories)} categorías")
+          PY
+
+      - name: Guardar cambios del catálogo
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add peliculas/ category_list.json
+          if git diff --cached --quiet; then
+            echo "ℹ️ El catálogo no tuvo cambios; no se crea commit."
+            exit 0
+          fi
+          git commit -m "🔄 Catálogo organizado - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          git push
